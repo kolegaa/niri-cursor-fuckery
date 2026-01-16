@@ -2335,8 +2335,13 @@ impl Niri {
         seat.add_pointer();
 
         let cursor_shape_manager_state = CursorShapeManagerState::new::<State>(&display_handle);
-        let cursor_manager =
-            CursorManager::new(&config_.cursor.xcursor_theme, config_.cursor.xcursor_size);
+        let vector_theme_path =
+            std::path::PathBuf::from("/home/duck/Desktop/coding/niri/resources/cursors");
+        let cursor_manager = CursorManager::new_with_vector_theme(
+            &config_.cursor.xcursor_theme,
+            config_.cursor.xcursor_size,
+            Some(vector_theme_path),
+        );
 
         let mod_key = backend.mod_key(&config.borrow());
         let mods_with_mouse_binds = mods_with_mouse_binds(mod_key, &config_.binds);
@@ -3661,6 +3666,26 @@ impl Niri {
                     Ok(element) => push(element.into()),
                     Err(err) => {
                         warn!("error importing a cursor texture: {err:?}");
+                    }
+                }
+            }
+            RenderCursor::Vector { hotspot, buffer } => {
+                let hotspot_logical = hotspot.to_logical(1);
+                let pointer_pos = (pointer_pos - hotspot_logical.to_f64())
+                    .to_physical_precise_round(output_scale);
+
+                match MemoryRenderBufferRenderElement::from_buffer(
+                    renderer,
+                    pointer_pos,
+                    &buffer,
+                    None,
+                    None,
+                    None,
+                    Kind::Cursor,
+                ) {
+                    Ok(element) => push(element.into()),
+                    Err(err) => {
+                        warn!("error importing a vector cursor texture: {err:?}");
                     }
                 }
             }

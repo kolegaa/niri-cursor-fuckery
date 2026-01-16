@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::env;
 use std::fs::File;
 use std::io::Read;
+use std::path::PathBuf;
 use std::rc::Rc;
 
 use anyhow::{anyhow, Context};
@@ -15,6 +16,11 @@ use smithay::wayland::compositor::with_states;
 use xcursor::parser::{parse_xcursor, Image};
 use xcursor::CursorTheme;
 
+use crate::cur_buf::{get_cursor_hotspot, get_cursor_surface};
+use crate::cursor::vector::{CursorAnimator, VectorCursorStore};
+
+pub mod vector;
+
 /// Some default looking `left_ptr` icon.
 static FALLBACK_CURSOR_DATA: &[u8] = include_bytes!("../resources/cursor.rgba");
 
@@ -25,19 +31,118 @@ pub struct CursorManager {
     size: u8,
     current_cursor: CursorImageStatus,
     named_cursor_cache: RefCell<XCursorCache>,
+    vector_system: Option<VectorCursorSystem>,
+    icon_to_vector_id: HashMap<CursorIcon, String>,
+}
+
+struct VectorCursorSystem {
+    store: VectorCursorStore,
+    animator: CursorAnimator,
 }
 
 impl CursorManager {
     pub fn new(theme: &str, size: u8) -> Self {
+        Self::new_with_vector_theme(theme, size, None)
+    }
+
+    pub fn new_with_vector_theme(
+        theme: &str,
+        size: u8,
+        vector_theme_path: Option<PathBuf>,
+    ) -> Self {
         Self::ensure_env(theme, size);
 
         let theme = CursorTheme::load(theme);
+
+        let vector_system = if let Some(path) = vector_theme_path {
+            debug!("Loading vector cursor system from path: {}", path.display());
+            let result = Self::load_vector_system(&path, size);
+            match &result {
+                Ok(_) => info!("Vector cursor system loaded successfully"),
+                Err(e) => warn!(
+                    "Failed to load vector cursor system: {:?}, will use XCursor fallback",
+                    e
+                ),
+            }
+            result.ok()
+        } else {
+            debug!("No vector theme path provided, using XCursor only");
+            None
+        };
+
+        let icon_to_vector_id = if vector_system.is_some() {
+            info!("Vector system available, mapping CursorIcon to vector cursor IDs");
+            let vs = vector_system.as_ref().unwrap();
+            let config = vs.store.get_config();
+
+            debug!("Available cursors in config: {:?}", config.cursors.keys());
+
+            let mut mapping = HashMap::new();
+
+            // Map CursorIcon enum variants to vector cursor IDs
+            // Use CursorIcon::name() to get the xcursor name
+            for (cursor_id, _) in &config.cursors {
+                debug!("Processing cursor ID: '{}'", cursor_id);
+
+                // Try to find matching CursorIcon by name
+                // Common cursor names in XCursor themes
+                let icon_name = cursor_id.to_lowercase();
+
+                let icon = match icon_name.as_str() {
+                    "default" | "left_ptr" => CursorIcon::Default,
+                    "move" | "fleur" | "move" => CursorIcon::AllScroll,
+                    "text" | "xterm" | "ibeam" => CursorIcon::Text,
+                    "wait" | "watch" => CursorIcon::Wait,
+                    "progress" | "left_ptr_watch" => CursorIcon::Progress,
+                    "crosshair" | "cross_reverse" => CursorIcon::Crosshair,
+                    "nwse-resize" | "top_left_corner" => CursorIcon::NwResize,
+                    "pointer" | "hand" | "hand1" | "hand2" => CursorIcon::Pointer,
+                    "grab" | "openhand" => CursorIcon::Grab,
+                    "grabbing" | "grabbing" | "closedhand" => CursorIcon::Grabbing,
+                    "not-allowed" | "circle" | "dnd-none" => CursorIcon::NotAllowed,
+                    "help" | "question_arrow" => CursorIcon::Help,
+                    "copy" => CursorIcon::Copy,
+                    "alias" => CursorIcon::Alias,
+                    "cell" => CursorIcon::Cell,
+                    "vertical-text" => CursorIcon::VerticalText,
+                    "context-menu" => CursorIcon::ContextMenu,
+                    "no-drop" => CursorIcon::NoDrop,
+                    "col-resize" | "sb_h_double_arrow" => CursorIcon::WResize,
+                    "row-resize" | "sb_v_double_arrow" => CursorIcon::NResize,
+                    "ew-resize" => CursorIcon::WResize,
+                    "ns-resize" => CursorIcon::NResize,
+                    "nesw-resize" | "top_right_corner" => CursorIcon::NeResize,
+                    "swne-resize" | "bottom_left_corner" => CursorIcon::SwResize,
+                    "sene-resize" | "bottom_right_corner" => CursorIcon::SeResize,
+                    "zoom-in" => CursorIcon::ZoomIn,
+                    "zoom-out" => CursorIcon::ZoomOut,
+                    _ => {
+                        debug!("No CursorIcon match for cursor ID: '{}'", cursor_id);
+                        continue;
+                    }
+                };
+
+                mapping.insert(icon, cursor_id.clone());
+                info!(
+                    "Mapped cursor icon {:?} (name: '{}') to vector cursor '{}'",
+                    icon, cursor_id, cursor_id
+                );
+            }
+
+            info!("Mapped {} cursor icons to vector cursors", mapping.len());
+            mapping
+        } else {
+            info!("No vector system available, no cursor icon mapping");
+            HashMap::new()
+        };
 
         Self {
             theme,
             size,
             current_cursor: CursorImageStatus::default_named(),
             named_cursor_cache: Default::default(),
+            vector_system,
+            icon_to_vector_id,
         }
     }
 
@@ -47,6 +152,35 @@ impl CursorManager {
         self.theme = CursorTheme::load(theme);
         self.size = size;
         self.named_cursor_cache.get_mut().clear();
+    }
+
+    fn load_vector_system(path: &PathBuf, size: u8) -> anyhow::Result<VectorCursorSystem> {
+        use crate::cursor::vector::CursorThemeConfig;
+        use std::fs;
+
+        debug!(
+            "load_vector_system called with path: {}, size: {}",
+            path.display(),
+            size
+        );
+        let config_path = path.join("theme.toml");
+        debug!("Config path: {}", config_path.display());
+
+        let config_str = fs::read_to_string(&config_path)
+            .with_context(|| format!("Failed to read config file: {}", config_path.display()))?;
+        debug!("Config file read successfully, parsing TOML...");
+
+        let config = CursorThemeConfig::from_toml(&config_str)
+            .with_context(|| "Failed to parse TOML config")?;
+        debug!(
+            "TOML parsed successfully, {} cursors defined",
+            config.cursors.len()
+        );
+
+        let store = VectorCursorStore::new(path.clone(), config, size)?;
+        let animator = CursorAnimator::new(store.get_config().clone(), size);
+
+        Ok(VectorCursorSystem { store, animator })
     }
 
     /// Checks if the cursor WlSurface is alive, and if not, cleans it up.
@@ -60,6 +194,20 @@ impl CursorManager {
 
     /// Get the current rendering cursor.
     pub fn get_render_cursor(&self, scale: i32) -> RenderCursor {
+        // Try vector system first
+        if let Some(vector) = &self.vector_system {
+            if let Ok(render_cursor) = self.get_vector_cursor(vector, scale) {
+                return render_cursor;
+            }
+        }
+
+        // Try to get the custom cursor surface from curBuf
+        if let Some(surface) = get_cursor_surface() {
+            let hotspot = get_cursor_hotspot();
+            return RenderCursor::Surface { hotspot, surface };
+        }
+
+        // Fallback to original logic if no custom surface is available
         match self.current_cursor.clone() {
             CursorImageStatus::Hidden => RenderCursor::Hidden,
             CursorImageStatus::Surface(surface) => {
@@ -77,6 +225,44 @@ impl CursorManager {
             }
             CursorImageStatus::Named(icon) => self.get_render_cursor_named(icon, scale),
         }
+    }
+
+    fn get_vector_cursor(
+        &self,
+        vector: &VectorCursorSystem,
+        scale: i32,
+    ) -> Result<RenderCursor, anyhow::Error> {
+        use crate::cursor::vector::types::TransitionState;
+
+        debug!("get_vector_cursor called with scale: {}", scale);
+        let state = vector.animator.current_state();
+        debug!("Current animator state: {:?}", state);
+
+        let cursor_id = match &*state {
+            TransitionState::Static => {
+                debug!("State is Static, returning error");
+                return Err(anyhow::anyhow!("No active cursor"));
+            }
+            TransitionState::Animated { cursor_id, .. } => {
+                debug!("State is Animated with cursor: '{}'", cursor_id);
+                cursor_id.clone()
+            }
+            TransitionState::Transitioning { to_id, .. } => {
+                debug!("State is Transitioning to cursor: '{}'", to_id);
+                to_id.clone()
+            }
+        };
+
+        debug!("Getting renderer for cursor: '{}'", cursor_id);
+        let renderer = vector.store.get_renderer(&cursor_id)?;
+        debug!("Renderer obtained, rendering frame 0");
+        let frame_data = renderer.render_frame(0, scale)?;
+        debug!("Frame rendered successfully");
+
+        Ok(RenderCursor::Vector {
+            hotspot: frame_data.hotspot,
+            buffer: frame_data.buffer,
+        })
     }
 
     fn get_render_cursor_named(&self, icon: CursorIcon, scale: i32) -> RenderCursor {
@@ -151,6 +337,23 @@ impl CursorManager {
 
     /// Set new cursor image provider.
     pub fn set_cursor_image(&mut self, cursor: CursorImageStatus) {
+        debug!("set_cursor_image called with cursor: {:?}", cursor);
+
+        // Update vector animator if we have a vector system
+        if let Some(vector) = &mut self.vector_system {
+            if let CursorImageStatus::Named(icon) = &cursor {
+                if let Some(vector_id) = self.icon_to_vector_id.get(icon) {
+                    debug!("Updating vector animator to cursor: {}", vector_id);
+                    match vector.animator.set_cursor(vector_id) {
+                        Ok(()) => debug!("Vector animator updated successfully"),
+                        Err(err) => warn!("Failed to update vector animator: {:?}", err),
+                    }
+                } else {
+                    debug!("No vector cursor mapping for icon: {:?}", icon);
+                }
+            }
+        }
+
         self.current_cursor = cursor;
     }
 
@@ -222,6 +425,10 @@ pub enum RenderCursor {
         icon: CursorIcon,
         scale: i32,
         cursor: Rc<XCursor>,
+    },
+    Vector {
+        hotspot: Point<i32, Physical>,
+        buffer: MemoryRenderBuffer,
     },
 }
 
