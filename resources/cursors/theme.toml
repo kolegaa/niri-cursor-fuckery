@@ -1,0 +1,36 @@
+# Niri Vector Cursor Theme Configuration
+
+[cursors.default]
+format = "svg"
+file = "vectors/default.svg"
+
+[cursors.move]
+format = "svg"
+file = "vectors/move.svg"
+
+[cursors.text]
+format = "svg"
+file = "vectors/text.svg"
+
+[cursors.wait]
+format = "svg"
+file = "vectors/wait.svg"
+
+[cursors.progress]
+format = "lottie"
+file = "lottie/loading.json"
+loop_mode = "loop"
+
+[cursors.crosshair]
+format = "svg"
+file = "vectors/crosshair.svg"
+
+[cursors.nwse-resize]
+format = "svg"
+file = "vectors/resize-diagonal.svg"
+
+[transitions."default->move"]
+transition_type = "crossfade"
+duration_ms = 200
+easing = "easeinout"
+
